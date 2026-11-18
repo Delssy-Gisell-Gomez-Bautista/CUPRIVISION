@@ -1,0 +1,754 @@
+﻿# ARCHIVO: local/server.py
+
+"""Servidor local. Ejecutar desde la carpeta raíz: python local/server.py"""
+import os
+os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL','-8')
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT','60')
+import base64, threading, time
+from pathlib import Path
+from urllib.parse import urlsplit
+import numpy as np
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from engine import Engine, calibration
+
+ROOT=Path(__file__).resolve().parents[1]
+app=FastAPI(title='CUPRIVISION local',docs_url=None,redoc_url=None)
+ALLOWED={'http://127.0.0.1:8765','http://localhost:8765',
+         'https://cuprivision-monitor.lenintorres1105.chatgpt.site'}
+# Para una instalación en otro origen, añade únicamente ese origen exacto.
+extra=os.environ.get('CUPRI_ALLOWED_ORIGIN')
+if extra:ALLOWED.add(extra)
+app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED),
+                   allow_methods=['GET','POST','OPTIONS'],allow_headers=['Content-Type'])
+
+@app.middleware('http')
+async def origin_guard(request:Request,call_next):
+    origin=request.headers.get('origin')
+    if request.url.path.startswith('/api/') and origin and origin not in ALLOWED:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({'detail':'Origen no autorizado.'},status_code=403)
+    if request.headers.get('content-length','0').isdigit() and int(request.headers.get('content-length','0'))>6_000_000:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({'detail':'Petición demasiado grande.'},status_code=413)
+    return await call_next(request)
+
+engine=Engine()
+
+class Analysis(BaseModel):
+    image:str=Field(max_length=5_000_000)
+    time:float
+    config:dict
+class Authorization(BaseModel):
+    id:int=Field(ge=1)
+    duration:float=Field(gt=0,le=3600)
+    responsible:str=Field(min_length=1,max_length=100)
+class CameraSource(BaseModel):
+    source:str=Field(min_length=1,max_length=2048)
+
+@app.get('/api/status')
+def status():return engine.status()
+@app.post('/api/load')
+def load():engine.load();return engine.status()
+@app.post('/api/reset')
+def reset():engine.reset();return {'ok':True}
+@app.post('/api/authorize')
+def authorize(a:Authorization):
+    try:engine.authorize(a.id,a.duration,a.responsible)
+    except ValueError as e:raise HTTPException(400,str(e))
+    return {'ok':True}
+@app.post('/api/calibrate')
+def calibrate(c:dict):
+    try:return calibration(c)
+    except (ValueError,KeyError,TypeError,np.linalg.LinAlgError) as e:raise HTTPException(400,str(e))
+@app.post('/api/analyze')
+def analyze(a:Analysis):
+    try:
+        import cv2
+        if not a.image.startswith('data:image/jpeg;base64,'):raise ValueError('Se requiere JPEG.')
+        raw=base64.b64decode(a.image.split(',',1)[1],validate=True)
+        frame=cv2.imdecode(np.frombuffer(raw,dtype=np.uint8),cv2.IMREAD_COLOR)
+        if frame is None or frame.shape[0]*frame.shape[1]>4_000_000:raise ValueError('Imagen no válida o demasiado grande.')
+        return engine.analyze(frame,a.time,a.config)
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(400,str(e))
+    except ImportError:raise HTTPException(503,'Falta OpenCV. Ejecuta la instalación de dependencias.')
+    except Exception:raise HTTPException(500,'Falló la inferencia. Revisa los modelos y reinicia el motor.')
+
+class Camera:
+    def __init__(self):
+        self.stop=threading.Event();self.frame=None;self.timestamp=0;self.error='';self.lock=threading.Lock()
+    def start(self,source):
+        u=urlsplit(source)
+        if u.scheme not in ('rtsp','rtsps','http','https') or not u.hostname:raise ValueError('Dirección de cámara no válida.')
+        threading.Thread(target=self.run,args=(source,),daemon=True).start()
+    def run(self,source):
+        cap=None
+        try:
+            import cv2
+            cap=cv2.VideoCapture(source,cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,5000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,5000])
+            if not cap.isOpened():self.error='No se pudo abrir la cámara. Revisa red y credenciales.';return
+            while not self.stop.is_set():
+                ok,frame=cap.read()
+                if not ok:self.error='Se perdió la conexión con la cámara.';break
+                h,w=frame.shape[:2]
+                if w>960:frame=cv2.resize(frame,(960,round(h*960/w)))
+                ok,encoded=cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,75])
+                if ok:
+                    with self.lock:self.frame=encoded.tobytes();self.timestamp=time.monotonic()
+        except Exception:self.error='No se pudo leer la cámara. Verifica OpenCV y la dirección.'
+        finally:
+            if cap is not None:cap.release()
+
+camera=None
+@app.post('/api/camera/open')
+def camera_open(s:CameraSource):
+    global camera
+    if camera is not None:camera.stop.set()
+    c=Camera()
+    try:c.start(s.source)
+    except ValueError as e:raise HTTPException(400,str(e))
+    camera=c;engine.reset();return {'ok':True}
+@app.post('/api/camera/close')
+def camera_close():
+    global camera
+    if camera is not None:camera.stop.set()
+    camera=None;return {'ok':True}
+@app.get('/api/camera/frame')
+def camera_frame():
+    c=camera
+    if c is None:raise HTTPException(400,'No hay cámara conectada.')
+    # Tiempo acotado de espera del primer fotograma.
+    end=time.monotonic()+7
+    while c.frame is None and not c.error and time.monotonic()<end:time.sleep(.05)
+    if c.error:raise HTTPException(503,c.error)
+    with c.lock:
+        if c.frame is None or time.monotonic()-c.timestamp>8:raise HTTPException(503,'La cámara no entrega imágenes recientes.')
+        return {'image':'data:image/jpeg;base64,'+base64.b64encode(c.frame).decode(),'time':c.timestamp}
+
+@app.get('/downloads/CUPRIVISION.zip')
+def source_download():
+    import sys
+    from fastapi.responses import FileResponse
+    sys.path.insert(0,str(ROOT))
+    from make_package import build
+    path=ROOT/'dist'/'downloads'/'CUPRIVISION.zip'
+    if not path.exists():path=build()
+    return FileResponse(path,filename='CUPRIVISION.zip',media_type='application/zip')
+
+app.mount('/',StaticFiles(directory=ROOT/'dist',html=True),name='ui')
+if __name__=='__main__':
+    import uvicorn
+    print('\nCUPRIVISION: abre http://127.0.0.1:8765\n')
+    uvicorn.run(app,host='127.0.0.1',port=8765,access_log=False)
+
+
+# ARCHIVO: local/engine.py
+
+"""CUPRIVISION: inferencia local y reglas observacionales, sin confirmar eventos."""
+from __future__ import annotations
+import math, time, threading, urllib.request, hashlib, json
+from collections import deque
+from pathlib import Path
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+MODELS = ROOT / 'models'
+MODELS.mkdir(exist_ok=True)
+PPE_REPO = 'Hexmon/vyra-yolo-ppe-detection'
+MACHINE_URL = ('https://raw.githubusercontent.com/snehilsanyal/'
+               'Construction-Site-Safety-PPE-Detection/main/models/best.pt')
+
+
+def norm(s):
+    return ''.join(c for c in s.lower() if c.isalnum())
+
+
+def gear_class(label):
+    s, state = norm(label), 'present'
+    for prefix, value in [('incorrect','incorrect'),('improper','incorrect'),
+                          ('without','absent'),('missing','absent'),('no','absent')]:
+        if s.startswith(prefix):
+            s, state = s[len(prefix):], value
+            break
+    names = {'helmet':'casco','hardhat':'casco','safetyhelmet':'casco',
+             'vest':'chaleco','safetyvest':'chaleco','reflectivevest':'chaleco',
+             'glasses':'ocular','glass':'ocular','safetyglasses':'ocular',
+             'goggles':'ocular','safetygoggles':'ocular','eyeprotection':'ocular',
+             'glove':'guantes','gloves':'guantes','safetygloves':'guantes'}
+    return (names[s],state) if s in names else None
+
+
+def inside(point, poly):
+    if point is None or poly is None or len(poly)<3:
+        return False
+    x,y=point; hit=False
+    for i,a in enumerate(poly):
+        b=poly[(i+1)%len(poly)]
+        cross=(x-a[0])*(b[1]-a[1])-(y-a[1])*(b[0]-a[0])
+        if abs(cross)<1e-9 and min(a[0],b[0])-1e-9<=x<=max(a[0],b[0])+1e-9 and min(a[1],b[1])-1e-9<=y<=max(a[1],b[1])+1e-9:
+            return True
+        if (a[1]>y)!=(b[1]>y) and x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0]:
+            hit=not hit
+    return hit
+
+
+def angle(a,b):
+    a,b=np.asarray(a),np.asarray(b)
+    n=np.linalg.norm(a)*np.linalg.norm(b)
+    return None if n<1e-8 else float(np.degrees(np.arccos(np.clip(np.dot(a,b)/n,-1,1))))
+
+
+def project(p,H):
+    if p is None:return None
+    r=np.asarray(H)@np.array([p[0],p[1],1.])
+    if not np.all(np.isfinite(r)) or abs(r[2])<1e-8:return None
+    return r[:2]/r[2]
+
+
+def calibration(c):
+    pts=np.asarray(c['points'],dtype=float)
+    w,h,x,y,tol=[float(c[k]) for k in ('width','height','checkX','checkY','tolerance')]
+    if pts.shape!=(5,2) or not np.all(np.isfinite(pts)) or np.any(pts<0) or np.any(pts>1):
+        raise ValueError('Se requieren cinco puntos normalizados válidos.')
+    if not all(math.isfinite(v) for v in (w,h,x,y,tol)) or min(w,h,tol)<=0 or not(0<=x<=w and 0<=y<=h):
+        raise ValueError('Medidas reales inválidas.')
+    corners=pts[:4]
+    crosses=[]
+    for i in range(4):
+        a,b,d=corners[i],corners[(i+1)%4],corners[(i+2)%4]
+        v,u=b-a,d-b;crosses.append(v[0]*u[1]-v[1]*u[0])
+    if not(all(z>1e-7 for z in crosses) or all(z< -1e-7 for z in crosses)):
+        raise ValueError('Las esquinas deben formar un cuadrilátero convexo ordenado.')
+    if not inside(pts[4],corners):raise ValueError('El quinto punto debe estar dentro del área.')
+    if min(np.linalg.norm(pts[4]-p) for p in corners)<.01:
+        raise ValueError('El quinto punto debe ser independiente de las esquinas.')
+    A=[];B=[]
+    for (a,b),(X,Y) in zip(corners,[(0,0),(w,0),(w,h),(0,h)]):
+        A.extend([[a,b,1,0,0,0,-X*a,-X*b],[0,0,0,a,b,1,-Y*a,-Y*b]])
+        B.extend([X,Y])
+    if np.linalg.cond(A)>1e10:raise ValueError('Geometría de calibración inestable.')
+    H=np.append(np.linalg.solve(A,B),1).reshape(3,3)
+    q=project(pts[4],H)
+    if q is None:raise ValueError('No se puede proyectar el punto de control.')
+    error=float(np.linalg.norm(q-[x,y]))
+    if error>tol:raise ValueError(f'Comprobación rechazada: error {error:.3f} m > {tol:.3f} m.')
+    return {'H':H.tolist(),'error':error,'checked':True}
+
+
+def validate_config(c):
+    numeric=['confidence','dwell','maxGap','release','trunk','arm','knee','distance','speed','radius']
+    for k in numeric:
+        v=c.get(k)
+        if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<0:
+            raise ValueError(f'Valor inválido: {k}')
+    if not 0<c['confidence']<1 or min(c['dwell'],c['maxGap'],c['release'])<=0:
+        raise ValueError('Confianza o intervalos inválidos.')
+    if any(c[k]>180 for k in ['trunk','arm','knee']):raise ValueError('Ángulos fuera de rango.')
+    if not isinstance(c.get('gear'),dict) or not isinstance(c.get('zones'),dict):raise ValueError('Perfil incompleto.')
+    for name,p in c['zones'].items():
+        a=np.asarray(p,dtype=float)
+        if name not in ['restricted','approach','position'] or a.ndim!=2 or a.shape[1]!=2 or not 3<=len(a)<=30 or not np.all(np.isfinite(a)) or np.any(a<0) or np.any(a>1):
+            raise ValueError('Zona inválida.')
+    if c.get('validated') and (not c.get('task') or not c.get('responsible')):raise ValueError('Falta tarea o responsable.')
+    return c
+
+
+class Engine:
+    def __init__(self):
+        self.pose=self.ppe=self.machines=None
+        self.loading=False;self.errors=[];self.map={};self.machine_ids=[];self.fingerprints={}
+        self.lock=threading.RLock();self.history={};self.last_seen={};self.auth={};self.last_time=None
+
+    def status(self):
+        return {'pose':self.pose is not None,'ppe':self.ppe is not None,
+                'machines':self.machines is not None and bool(self.machine_ids),
+                'loading':self.loading,'errors':self.errors[:],
+                'classes':list(self.map),'models':self.fingerprints.copy(),
+                'absence':{g:any(v==(g,'absent') for v in self.map.values()) for g in ['casco','chaleco','ocular','guantes']}}
+
+    def load(self):
+        if self.loading:return
+        self.loading=True
+        threading.Thread(target=self._load,daemon=True).start()
+
+    def _load(self):
+        self.errors=[]
+        try:
+            from ultralytics import YOLO
+            jobs=['pose','ppe','machines']
+            for name in jobs:
+                if getattr(self,name) is not None:continue
+                try:
+                    if name=='pose':path=MODELS/'yolo11n-pose.pt'
+                    elif name=='ppe':
+                        path=MODELS/'ppe.pt'
+                        if not path.exists():
+                            from huggingface_hub import hf_hub_download
+                            path=Path(hf_hub_download(PPE_REPO,'best.pt',local_dir=MODELS/'ppe-cache'))
+                    else:
+                        path=MODELS/'maquinaria.pt'
+                        if not path.exists():
+                            temp=path.with_suffix('.partial')
+                            try:
+                                with urllib.request.urlopen(MACHINE_URL,timeout=60) as response,temp.open('wb') as out:
+                                    total=0
+                                    while chunk:=response.read(1024*1024):
+                                        total+=len(chunk)
+                                        if total>512*1024*1024:raise ValueError('Modelo demasiado grande.')
+                                        out.write(chunk)
+                                if total<100_000:raise ValueError('Descarga incompleta.')
+                                temp.replace(path)
+                            finally:
+                                if temp.exists():temp.unlink()
+                    model=YOLO(str(path))
+                    digest=hashlib.sha256()
+                    with path.open('rb') as source:
+                        for block in iter(lambda:source.read(1024*1024),b''):digest.update(block)
+                    with self.lock:
+                        self.fingerprints[name]={'file':path.name,'sha256':digest.hexdigest()}
+                        setattr(self,name,model)
+                        if name=='ppe':self.map={v:gear_class(v) for v in model.names.values() if gear_class(v)}
+                        if name=='machines':
+                            accepted={'machinery','vehicle','forklift','truck','bus','car','excavator','loader','tractor'}
+                            self.machine_ids=[int(k) for k,v in model.names.items() if norm(v) in accepted]
+                    if name=='ppe' and not self.map:self.errors.append('EPP: las clases no corresponden al mapa de equipos.')
+                    if name=='machines' and not self.machine_ids:self.errors.append('No hay clases de maquinaria reconocidas.')
+                except Exception as exc:
+                    self.errors.append(f'{name}: no se pudo cargar ({type(exc).__name__}). Revisa instalación o añade el modelo local.')
+        except ImportError:
+            self.errors.append('Instala las dependencias de requirements.txt para cargar los modelos.')
+        finally:self.loading=False
+
+    def reset(self):
+        with self.lock:
+            self.history.clear();self.last_seen.clear();self.auth.clear();self.last_time=None
+            for model in (self.pose,self.machines):
+                predictor=getattr(model,'predictor',None)
+                for tracker in getattr(predictor,'trackers',[]):tracker.reset()
+
+    def authorize(self,id,duration,responsible):
+        with self.lock:
+            if self.last_time is None or id not in self.last_seen:raise ValueError('El ID no está visible en el análisis actual.')
+            if not math.isfinite(duration) or not 0<duration<=3600 or not responsible.strip():raise ValueError('Autorización inválida.')
+            self.auth[id]={'expires':self.last_time+duration,'responsible':responsible.strip()}
+
+    def velocity(self,key,p,t,gap):
+        if p is None:self.history.pop(key,None);return None
+        history=self.history.setdefault(key,deque())
+        if history and t-history[-1][0]>gap:history.clear()
+        history.append((t,np.asarray(p)))
+        while len(history)>2 and t-history[0][0]>2:history.popleft()
+        if len(history)<3 or history[-1][0]-history[0][0]<.5:return None
+        ts=np.array([x[0] for x in history],dtype=float);ts-=ts.mean()
+        denom=float(ts@ts)
+        return None if denom<1e-8 else (ts[:,None]*np.array([x[1] for x in history])).sum(0)/denom
+
+    def rules(self,p,equipment,c,t,H):
+        alerts={};kp=np.asarray(p['kp']);kc=np.asarray(p['kc'])
+        def add(d,s):alerts.setdefault(d,[]).append(s)
+        for gear,required in c['gear'].items():
+            if not required:continue
+            evidence=p.get('gear',{}).get(gear,{})
+            neg=max(evidence.get('absent',0),evidence.get('incorrect',0));pos=evidence.get('present',0)
+            if neg>=c['confidence'] and neg>pos+.05:
+                kind='uso incorrecto' if evidence.get('incorrect',0)>=evidence.get('absent',0) else 'ausencia'
+                add('D1',f'{gear}: evidencia explícita de {kind}')
+        foot=p.get('foot');world=None
+        if c.get('geometryValid') and foot is not None:
+            restricted=inside(foot,c['zones'].get('restricted'));approach=inside(foot,c['zones'].get('approach'))
+            if (restricted or approach) and p['id'] not in self.auth:
+                add('D2',('Zona restringida' if restricted else 'Zona de aproximación')+': autorización no acreditada')
+            if inside(foot,c['zones'].get('position')):add('D3','Posición dentro de zona definida para la tarea')
+            if H is not None and inside(foot,c['calibration']['points'][:4]):world=project(foot,H)
+        if c.get('viewOK'):
+            if all(kc[i]>=.5 for i in [5,6,11,12]):
+                a=angle((kp[5]+kp[6]-kp[11]-kp[12])/2,[0,-1])
+                if c['trunk']>0 and a is not None and a>c['trunk']:add('D3','Inclinación 2D del tronco supera el criterio')
+            for shoulder,elbow,hip in [(5,7,11),(6,8,12)]:
+                if all(kc[i]>=.5 for i in [shoulder,elbow,hip]):
+                    a=angle(kp[elbow]-kp[shoulder],kp[hip]-kp[shoulder])
+                    if c['arm']>0 and a is not None and a>c['arm']:add('D3','Elevación 2D del brazo supera el criterio')
+            for hip,knee,ankle in [(11,13,15),(12,14,16)]:
+                if all(kc[i]>=.5 for i in [hip,knee,ankle]):
+                    a=angle(kp[hip]-kp[knee],kp[ankle]-kp[knee])
+                    if c['knee']>0 and a is not None and a<c['knee']:add('D3','Ángulo 2D de rodilla inferior al criterio')
+        vp=self.velocity(('person',p['id']),world,t,c['maxGap'])
+        if world is not None and min(c['distance'],c['speed'],c['radius'])>0:
+            for e in equipment:
+                q,v=e['world'],e['velocity']
+                if q is None or v is None or np.linalg.norm(v)<c['speed']:continue
+                delta=world-q;margin=float(np.linalg.norm(delta))-c['radius']
+                if margin<c['distance']:
+                    approach='trayectoria relativa no disponible' if vp is None else ('acercamiento relativo' if np.dot(delta,vp-v)<0 else 'sin acercamiento relativo')
+                    add('D4',f'Equipo {e["id"]}: margen estimado {margin:.2f} m; {approach}')
+        return alerts if c.get('validated') and p['id']>=0 else {}
+
+    def analyze(self,image,t,c):
+        with self.lock:
+            if self.pose is None:raise ValueError('Carga el modelo de pose antes de analizar.')
+            validate_config(c)
+            if not math.isfinite(t) or t<0:raise ValueError('Tiempo inválido.')
+            start=time.perf_counter()
+            if self.last_time is not None and (t<self.last_time or t-self.last_time>c['maxGap']):self.reset()
+            self.last_time=t;h,w=image.shape[:2]
+            opts=dict(conf=c['confidence'],verbose=False,imgsz=640,device='cpu')
+            r=self.pose.track(image,persist=True,tracker='bytetrack.yaml',**opts)[0]
+            persons=[]
+            if r.boxes is not None:
+                boxes=r.boxes.xyxy.cpu().numpy();ids=r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else [-1]*len(boxes)
+                for i,b in enumerate(boxes):
+                    kp=r.keypoints.xy[i].cpu().numpy() if r.keypoints is not None else np.zeros((17,2))
+                    kc=r.keypoints.conf[i].cpu().numpy() if r.keypoints is not None and r.keypoints.conf is not None else np.zeros(17)
+                    box=(b/np.array([w,h,w,h])).tolist();pid=int(ids[i])
+                    foot=[(box[0]+box[2])/2,box[3]] if kc[15]>=.5 and kc[16]>=.5 and box[3]<.995 else None
+                    persons.append(dict(id=pid,box=box,kp=kp,kc=kc,foot=foot,gear={}))
+                    if pid>=0:self.last_seen[pid]=t
+            self.last_seen={pid:v for pid,v in self.last_seen.items() if t-v<=c['maxGap']}
+            self.auth={pid:v for pid,v in self.auth.items() if v['expires']>=t and pid in self.last_seen}
+            if self.ppe is not None:
+                r=self.ppe.predict(image,**opts)[0]
+                if r.boxes is not None:
+                    for b,cls,conf in zip(r.boxes.xyxy.cpu().numpy(),r.boxes.cls.cpu().numpy().astype(int),r.boxes.conf.cpu().numpy()):
+                        mapping=self.map.get(r.names[int(cls)])
+                        if mapping is None:continue
+                        gear,state=mapping;center=(b[:2]+b[2:])/2;candidates=[]
+                        for p in persons:
+                            if p['id']<0:continue
+                            kp,kc=p['kp'],p['kc'];height=max((p['box'][3]-p['box'][1])*h,1)
+                            if gear=='casco':
+                                visible=[i for i in range(5) if kc[i]>=.5]
+                                targets=[kp[visible].mean(0)-[0,.06*height]] if len(visible)>=2 and p['box'][1]>.005 else []
+                                limit=.25
+                            elif gear=='ocular':targets=[(kp[1]+kp[2])/2] if kc[1]>=.5 and kc[2]>=.5 else [];limit=.15
+                            elif gear=='chaleco':targets=[kp[[5,6,11,12]].mean(0)] if all(kc[i]>=.5 for i in [5,6,11,12]) else [];limit=.28
+                            else:targets=[kp[i] for i in [9,10] if kc[i]>=.5];limit=.18
+                            if targets:
+                                distance=min(np.linalg.norm(center-q)/height for q in targets)
+                                if distance<=limit:candidates.append((float(distance),p))
+                        candidates.sort(key=lambda a:a[0])
+                        if candidates and (len(candidates)==1 or candidates[1][0]-candidates[0][0]>=.04):
+                            states=candidates[0][1]['gear'].setdefault(gear,{})
+                            states[state]=max(states.get(state,0),float(conf))
+            H=None;warnings=[]
+            if c.get('geometryValid') and c.get('calibration'):
+                checked=calibration(c['calibration']);H=checked['H']
+            if not self.ppe:warnings.append('D1 sin modelo EPP')
+            elif any(c['gear'].get(g) and not any(v==(g,'absent') for v in self.map.values()) for g in c['gear']):warnings.append('D1: clases de ausencia incompletas')
+            if not c.get('geometryValid'):warnings.append('D2 sin geometría confirmada')
+            if not c.get('viewOK') and not c['zones'].get('position'):warnings.append('D3 sin criterio activo')
+            equipment=[]
+            enabled=H is not None and min(c['distance'],c['speed'],c['radius'])>0 and self.machines is not None and self.machine_ids
+            if enabled:
+                r=self.machines.track(image,persist=True,tracker='bytetrack.yaml',classes=self.machine_ids,**opts)[0]
+                if r.boxes is not None and r.boxes.id is not None:
+                    for b,pid in zip(r.boxes.xyxy.cpu().numpy(),r.boxes.id.cpu().numpy().astype(int)):
+                        foot=[(b[0]+b[2])/2/w,b[3]/h]
+                        q=project(foot,H) if foot[1]<.995 and inside(foot,c['calibration']['points'][:4]) else None
+                        velocity=self.velocity(('machine',int(pid)),q,t,c['maxGap'])
+                        equipment.append({'id':int(pid),'world':q,'velocity':velocity})
+            else:warnings.append('D4 no evaluable')
+            output=[]
+            for p in persons:
+                alerts=self.rules(p,equipment,c,t,H)
+                output.append({'id':p['id'],'box':p['box'],'alerts':alerts,'gear':p['gear']})
+            for key in list(self.history):
+                if t-self.history[key][-1][0]>c['maxGap']:del self.history[key]
+            return {'people':output,'ms':round((time.perf_counter()-start)*1000),'warnings':warnings}
+
+
+<!-- ARCHIVO: dist/index.html -->
+
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>CUPRIVISION · Monitor de seguridad</title><link rel="stylesheet" href="style.css"></head><body>
+<aside class="sidebar"><a class="brand" href="#monitor"><span class="logo">C<span>▰</span></span><div>CUPRI<span>VISION</span><small>SEGURIDAD OBSERVABLE</small></div></a><div class="nav-label">ESPACIO DE TRABAJO</div><nav><button data-view="monitor" class="active">▣ <span>Monitoreo</span></button><button data-view="events">▤ <span>Eventos</span><b id="nav-count">0</b></button><button data-view="profile">◈ <span>Criterios y zonas</span></button><button id="help-btn">ⓘ <span>Guía de uso</span></button></nav><div class="side-bottom"><div class="engine-indicator"><i id="engine-dot"></i><strong id="engine-label">Motor sin conectar</strong></div><p id="engine-note">Conecta el motor local para analizar imágenes.</p><button id="connect-btn" class="outline full">Conectar motor local ↗</button><a class="download" href="downloads/CUPRIVISION.zip" download>↓ Descargar programa</a><small>Archivos y eventos en este navegador.<br>Sin envío de grabaciones a la nube.</small></div></aside>
+<main><header><div class="breadcrumb">Espacio de trabajo <span>/</span> <b id="breadcrumb-current">Monitoreo</b></div><span class="private">◉ Espacio privado</span></header>
+<section class="page-heading"><div><span class="eyebrow">VISIÓN COMPUTACIONAL · SEGURIDAD LABORAL</span><h1 id="page-title">Monitoreo de seguridad</h1><p>Cuatro dimensiones. Evidencia visible. Decisiones verificadas.</p></div><button id="new-session" class="outline">＋ Nueva observación</button></section>
+<div class="notice"><span>ⓘ</span><div>Los avisos automáticos son <b>indicios pendientes de revisión</b>. Solo los eventos confirmados se incluyen en el total de actos inseguros.</div></div>
+<section class="metrics" id="metrics"></section>
+<section id="monitor-view" class="view"><div class="workspace"><article class="monitor-card"><div class="card-head"><div><span class="live-dot"></span><strong id="source-name">Sin fuente seleccionada</strong></div><span id="source-tag" class="tag">EN ESPERA</span></div><div id="stage" class="stage"><video id="video" playsinline controls hidden></video><img id="ip-image" alt="Imagen de la cámara IP" hidden><canvas id="overlay" aria-label="Dibujo de zonas sobre la imagen"></canvas><div class="empty-camera" id="empty-camera"><div class="camera-symbol"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="8" y="17" width="34" height="30" rx="6"/><path d="M42 27 56 20v24l-14-7"/><circle cx="25" cy="32" r="6"/></svg></div><h2>Una nueva perspectiva de seguridad</h2><p>Carga un vídeo o conecta una cámara<br>para comenzar tu observación.</p><button id="empty-upload" class="primary">↑ Cargar vídeo</button><small>MP4, WebM y formatos compatibles con tu navegador</small></div><div id="draw-hint" hidden></div></div><div class="player-footer"><span id="clock">00:00</span><span id="analysis-state">Análisis detenido</span><button id="analyze-btn" class="primary" disabled>▶ Iniciar análisis</button><button id="stop-btn" class="outline" disabled>■ Detener</button></div><div class="monitor-footnote"><span>▱ Procesamiento local</span><span id="processing-info">Sin detecciones generadas</span></div></article>
+<aside class="setup-card"><div class="card-head"><strong>Preparar observación</strong><span class="step">01—03</span></div><div class="setup-body"><label class="section-label">01 / FUENTE DE IMAGEN</label><div class="source-tabs"><button id="upload-btn" class="selected">↑ Vídeo</button><button id="webcam-btn">◉ Webcam</button><button id="ip-btn">↗ IP / RTSP</button></div><input type="file" id="video-file" accept="video/*" hidden><div class="field-info" id="source-info">El archivo se reproduce en tu navegador.</div><label class="section-label">02 / CRITERIOS DE LA TAREA</label><div class="task-summary"><span class="tiny-label">TAREA ACTUAL</span><strong id="task-name">Sin configurar</strong><small id="profile-summary">Define el EPP exigido y los límites de evaluación.</small><button id="profile-btn" class="text-btn">Configurar criterios →</button></div><label class="section-label">03 / GEOMETRÍA DE LA ESCENA</label><label for="zone-kind" class="small-label">Zona a dibujar</label><select id="zone-kind"><option value="restricted">D2 · Área restringida</option><option value="approach">D2 · Área de aproximación</option><option value="position">D3 · Posición por tarea</option><option value="calibration">D4 · Calibración del suelo</option></select><div class="zone-buttons"><button id="draw-btn" class="outline">◇ Dibujar</button><button id="finish-draw" class="outline" hidden>✓ Guardar</button><button id="clear-zone" class="icon-btn" title="Eliminar zona seleccionada">×</button></div><p class="field-info" id="geometry-status">Las zonas necesitan una imagen de referencia.</p><label class="check"><input type="checkbox" id="geometry-valid"> Confirmé el encuadre y las zonas</label><button id="authorize-btn" class="text-btn">＋ Autorización temporal por ID</button></div></aside></div>
+</section>
+<section id="profile-view" class="view" hidden><article class="wide-card"><div class="card-head"><strong>Configuración de las cuatro dimensiones</strong><button class="primary" id="edit-profile-full">Editar criterios</button></div><div class="profile-overview" id="profile-overview"></div><p class="muted padded">Los ángulos 2D dependen de la vista. Las distancias requieren suelo plano, cámara fija y calibración. Una condición detectada debe interpretarse según la tarea y los controles existentes.</p></article></section>
+<section id="events-section" class="events-card"><div class="card-head"><div><strong>Registro de eventos</strong><span id="event-count" class="count">0</span></div><div class="row-actions"><button id="manual-btn" class="outline">＋ Observación manual</button><button id="csv-btn" class="outline">↓ CSV</button><button id="project-export" class="outline">↓ Proyecto</button><button id="project-import-btn" class="icon-btn" title="Importar proyecto">↑</button><input id="project-import" type="file" accept="application/json,.json" hidden></div></div><div class="event-tools"><div class="filter-tabs"><button data-filter="all" class="selected">Todos</button><button data-filter="pending">Pendientes</button><button data-filter="confirmed">Confirmados</button></div><small>Un evento · una dimensión principal</small></div><div class="table-wrap"><table><thead><tr><th>EVENTO / TIEMPO</th><th>DIMENSIONES</th><th>ORIGEN</th><th>ESTADO</th><th>REVISIÓN</th></tr></thead><tbody id="event-rows"></tbody></table></div><div id="empty-events" class="empty-events"><span>▤</span><strong>Aún no hay eventos registrados</strong><p>Los avisos del análisis y tus observaciones aparecerán aquí.</p></div></section>
+<footer><span>CUPRIVISION <b>·</b> Observación y revisión de seguridad</span><span id="storage-status">Guardado local en el navegador</span></footer></main>
+<dialog id="dialog"><form id="dialog-form"><div class="dialog-head"><div><span class="eyebrow" id="dialog-eyebrow">CONFIGURACIÓN</span><h2 id="dialog-title"></h2></div><button type="button" id="close-dialog" class="icon-btn" aria-label="Cerrar">×</button></div><div id="dialog-content"></div><div class="dialog-actions"><button type="button" id="cancel-dialog" class="outline">Cancelar</button><button id="dialog-submit" class="primary" type="submit">Guardar</button></div></form></dialog><div id="toast" role="status" hidden></div>
+<script src="rules.js"></script><script src="app.js"></script></body></html>
+
+
+/* ARCHIVO: dist/style.css */
+
+:root{--ink:#17332f;--muted:#75827e;--border:#e0e7e3;--green:#17644e;--lime:#c5e49b;--bg:#f4f6f3;--amber:#a56d24}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}button,input,select,textarea{font:inherit}button,a{ -webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}button:focus-visible,a:focus-visible{outline:3px solid #84b7a4;outline-offset:3px}button,a,input,select,textarea{border-radius:7px}button{border:0;transition:background .15s}button:hover:not(:disabled){filter:brightness(.95)}.sidebar{width:224px;position:fixed;inset:0 auto 0 0;background:#fff;border-right:1px solid var(--border);padding:34px 22px;display:flex;flex-direction:column;z-index:4}.brand{display:flex;gap:10px;align-items:center;text-decoration:none;color:var(--ink);font-weight:800;font-size:16px;letter-spacing:-.7px}.brand span:not(.logo){font-weight:400}.brand small{display:block;font-size:8px;letter-spacing:1.35px;margin-top:5px;font-weight:600;color:#789087}.logo{background:var(--green);width:35px;height:37px;display:grid;place-items:center;font-size:28px;border-radius:9px;color:#e4f2c8;position:relative}.logo span{position:absolute;right:4px;font-size:11px;bottom:6px}.nav-label{font-size:9px;letter-spacing:1.4px;color:#97a39c;margin:50px 9px 14px}nav button{display:flex;align-items:center;gap:13px;background:transparent;color:#6c7e74;width:100%;padding:13px 10px;text-align:left;margin:5px 0}nav button.active{background:#eaf3ed;color:var(--green);font-weight:650}nav b{margin-left:auto;background:#dce9df;padding:2px 6px;border-radius:5px;font-size:10px}.side-bottom{margin-top:auto;border-top:1px solid var(--border);padding-top:20px}.engine-indicator{display:flex;gap:7px;align-items:center;font-size:11px}.engine-indicator i,.live-dot{width:7px;height:7px;background:#99a39e;border-radius:50%;display:inline-block}.engine-indicator i.online{background:#5eab71}.side-bottom p{font-size:11px;line-height:1.6;color:var(--muted)}.side-bottom small{display:block;font-size:10px;line-height:1.7;color:#99a39e;margin-top:16px}.download{display:block;font-size:11px;text-align:center;margin:16px 0;color:var(--green);text-decoration:none}.full{width:100%}.primary,.outline{padding:10px 14px;font-size:12px;font-weight:600;white-space:nowrap}.primary{background:var(--green);color:white}.outline{background:white;border:1px solid var(--border);color:var(--ink)}.icon-btn{background:transparent;font-size:23px;color:#7d8c83;padding:2px 8px}.text-btn{padding:10px 0;background:transparent;color:var(--green);font-size:12px;font-weight:650}main{margin-left:224px;padding:0 36px;max-width:1800px}header{display:flex;align-items:center;justify-content:space-between;height:76px;border-bottom:1px solid var(--border);font-size:11px}.breadcrumb{color:#93a097}.breadcrumb span{margin:0 12px;color:#c2cbc5}.breadcrumb b{font-weight:500;color:#5a6e61}.private{background:white;border:1px solid var(--border);padding:7px 11px;border-radius:20px;color:#6b7e70}.page-heading{display:flex;align-items:center;justify-content:space-between;margin:32px 0 21px;gap:15px}.eyebrow{font-size:9px;font-weight:650;letter-spacing:1.45px;color:#748d7e}h1{font-size:29px;letter-spacing:-1px;font-weight:650;margin:10px 0}h2{font-size:20px;margin:14px 0 10px;letter-spacing:-.4px}.page-heading p{font-size:12px;color:var(--muted);margin:0}.notice{display:flex;gap:10px;align-items:center;padding:11px 15px;background:#edf1e9;border:1px solid #e1e8da;border-radius:8px;font-size:11px;line-height:1.6;color:#65735b}.notice>span{font-size:16px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:23px 0}.metric{background:white;border:1px solid var(--border);border-radius:10px;padding:17px 18px;min-height:125px}.metric-top{display:flex;align-items:center;justify-content:space-between}.dim-badge{font-size:10px;padding:4px 7px;border-radius:4px;background:#eef4ee;color:#58805b;font-weight:650}.metric h3{font-size:11px;font-weight:550;margin:12px 0 11px;min-height:14px}.metric-bottom{display:flex;align-items:baseline;gap:8px}.metric-number{font-size:26px;line-height:1;font-weight:550;letter-spacing:-1px}.metric-bottom small{font-size:9px;color:#8a968d}.metric .mini{font-size:9px;color:#97a299}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:20px}.monitor-card,.setup-card,.events-card,.wide-card{background:#fff;border:1px solid var(--border);border-radius:10px;overflow:hidden}.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 18px;border-bottom:1px solid var(--border);font-size:12px}.card-head strong{font-weight:600}.live-dot{margin-right:8px}.tag{font-size:8px;letter-spacing:.8px;padding:4px 7px;border:1px solid #dfe6e1;border-radius:4px;color:#88968b}.stage{aspect-ratio:16/10;background:#132923;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;background-image:linear-gradient(#ffffff03 1px,transparent 1px),linear-gradient(90deg,#ffffff03 1px,transparent 1px);background-size:36px 36px}.stage video,.stage>img{width:100%;height:100%;object-fit:contain}.stage canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.stage.drawing canvas{pointer-events:auto;cursor:crosshair}.empty-camera{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#e0ece2;text-align:center}.camera-symbol{width:72px;height:72px;background:#203b30;border:1px solid #355044;border-radius:20px;display:grid;place-items:center}.camera-symbol svg{width:42px;fill:none;stroke:#a0ba9f;stroke-width:2}.empty-camera h2{font-size:18px;font-weight:500;margin:20px 0 8px}.empty-camera p{color:#8da196;font-size:12px;line-height:1.7;margin:0 0 22px}.empty-camera .primary{background:var(--lime);color:#26452e}.empty-camera small{color:#6b8575;font-size:9px;margin-top:15px}.player-footer{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--border)}#clock{font-variant-numeric:tabular-nums;font-size:12px;color:#5e7164}#analysis-state{font-size:10px;color:#9aa59e;flex:1}.monitor-footnote{display:flex;justify-content:space-between;padding:12px 16px;font-size:9px;color:#93a196}.step{font-size:9px;color:#a5b0a7}.setup-body{padding:18px}.section-label{display:block;font-size:8px;letter-spacing:1.3px;color:#7d8e80;font-weight:700;margin:3px 0 12px}.source-tabs{display:flex;padding:3px;background:#f4f6f3;border:1px solid #e8ede7;border-radius:6px}.source-tabs button{flex:1;padding:8px 3px;font-size:10px;background:transparent;color:#8b988c;white-space:nowrap}.source-tabs .selected{background:#fff;box-shadow:0 1px 3px #22332216;color:#3c6249}.field-info{font-size:10px;line-height:1.6;color:#8d9b90;margin:10px 0 22px}.task-summary{border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:24px}.tiny-label{display:block;font-size:8px;letter-spacing:.7px;color:#9ca99f}.task-summary strong{display:block;font-size:12px;margin:9px 0 6px}.task-summary small{font-size:10px;line-height:1.6;color:#8b998d;display:block}.task-summary .text-btn{font-size:10px;padding-bottom:0}.small-label{display:block;font-size:10px;margin-bottom:7px;color:#7d8f80}select,input:not([type=checkbox]),textarea{border:1px solid #dce4dd;background:#fff;color:var(--ink);padding:9px 10px;width:100%;font-size:12px}select{font-size:10px}.zone-buttons{display:flex;gap:8px;margin:9px 0}.zone-buttons .outline{flex:1;font-size:10px}.check{display:flex;gap:7px;align-items:flex-start;font-size:10px;line-height:1.5;color:#69816d}.check input{accent-color:var(--green)}#authorize-btn{font-size:10px;margin-top:6px}.events-card{margin-top:24px}.count{margin-left:10px;color:#65816c;font-size:10px;padding:3px 6px;border:1px solid #e1e9e2;border-radius:5px}.row-actions{display:flex;align-items:center;gap:7px}.row-actions .outline{font-size:10px;padding:8px 10px}.event-tools{display:flex;align-items:center;justify-content:space-between;padding:14px 18px}.event-tools small{font-size:9px;color:#9ca79f}.filter-tabs{display:flex;gap:5px}.filter-tabs button{background:transparent;color:#95a197;font-size:10px;padding:7px 10px}.filter-tabs button.selected{background:#edf3ed;color:#46674d}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;text-align:left}th{font-size:8px;letter-spacing:.75px;font-weight:600;color:#9ca79e;background:#fafbf9;padding:12px 18px;border-block:1px solid #edf0eb}td{font-size:11px;padding:15px 18px;border-bottom:1px solid #eef2ed}td small{display:block;color:#91a08e;font-size:9px;margin-top:5px}.status{display:inline-block;padding:4px 7px;background:#f8f1e4;color:#a27b37;border-radius:4px;font-size:9px}.status.confirmed{background:#e8f2e9;color:#43714b}.status.discarded,.status.duplicate{background:#edf0ed;color:#8d998e}.empty-events{display:flex;align-items:center;flex-direction:column;padding:29px;color:#9da99f}.empty-events>span{font-size:24px;color:#c2cdc1;margin-bottom:10px}.empty-events strong{font-size:11px;font-weight:500;color:#718471}.empty-events p{font-size:10px;margin:7px 0}footer{display:flex;justify-content:space-between;margin:25px 0;font-size:9px;color:#a4aea5}footer b{margin:0 8px}dialog{border:1px solid var(--border);border-radius:14px;padding:25px;max-width:650px;width:calc(100% - 32px);max-height:90vh;box-shadow:0 20px 100px #142c3433;color:var(--ink)}dialog::backdrop{background:#112d2455;backdrop-filter:blur(3px)}.dialog-head{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}.dialog-head h2{margin:7px 0 0}.dialog-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:24px;padding-top:16px;border-top:1px solid var(--border)}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}.form-grid label{font-size:11px;color:#617b65;display:block}.form-grid input,.form-grid select{margin-top:7px}.span2{grid-column:span 2}.form-note{font-size:11px;color:#82907e;line-height:1.7}.form-grid fieldset{border:1px solid var(--border);border-radius:7px;padding:13px;grid-column:span 2}.form-grid legend{font-size:11px;color:#49654c}.form-grid .check{margin:8px 0}.form-grid .check input{margin-top:0;width:auto}.form-grid textarea{min-height:70px;margin-top:7px}#dialog-content>img{max-width:100%;border-radius:7px}.evidence-image{width:100%;max-height:250px;object-fit:contain;background:#142b23}#toast{position:fixed;bottom:25px;left:50%;transform:translateX(-40%);padding:13px 20px;background:#234b3b;color:#fff;font-size:12px;max-width:650px;border-radius:9px;box-shadow:0 8px 30px #1235;z-index:30;line-height:1.6}#draw-hint{position:absolute;left:12px;top:12px;background:#10261de8;color:#d4e8c5;font-size:11px;padding:10px 12px;border:1px solid #6b8f5d;border-radius:5px}.profile-overview{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding:24px}.profile-overview article{border:1px solid var(--border);border-radius:9px;padding:20px}.profile-overview h3{font-size:14px;line-height:1.5}.profile-overview p,.muted{color:#8a9989;font-size:12px;line-height:1.7}.padded{padding:0 24px 20px}.capability-list{font-size:12px;line-height:1.8;color:#667e69}.help-list{padding-left:20px;line-height:1.9;font-size:12px;color:#647d66}[hidden]{display:none!important}@media(min-width:1500px){main{padding:0 50px}.workspace{grid-template-columns:minmax(0,1fr) 320px}.stage{aspect-ratio:16/9}}@media(max-width:1150px){.sidebar{width:185px;padding:25px 15px}main{margin-left:185px;padding:0 22px}.workspace{grid-template-columns:minmax(0,1fr) 255px}.metrics{gap:9px}.metric{padding:14px 12px}.metric h3{font-size:10px}.stage{aspect-ratio:4/3}.empty-camera h2{font-size:15px}.page-heading h1{font-size:25px}.player-footer{flex-wrap:wrap}.empty-camera small{display:none}}@media(max-width:850px){.sidebar{position:static;width:100%;padding:14px 20px;flex-direction:row;align-items:center;border-right:0;border-bottom:1px solid var(--border)}.nav-label,.side-bottom{display:none}.sidebar nav{display:flex;margin-left:auto;gap:5px}.sidebar nav button{padding:9px;width:auto}.sidebar nav span,.sidebar nav b{display:none}.brand{font-size:14px}.brand small{font-size:7px}main{margin:0;padding:0 18px}header{height:55px}.workspace{grid-template-columns:1fr}.stage{aspect-ratio:16/10}.setup-body{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px}.setup-body>*{grid-column:span 2}.metrics{grid-template-columns:repeat(2,1fr)}.page-heading{margin-top:23px}.page-heading .outline{font-size:10px;padding:9px}.page-heading h1{font-size:23px}.eyebrow{font-size:8px}.card-head{flex-wrap:wrap}.row-actions{flex-wrap:wrap}.event-tools small{display:none}.form-grid,.profile-overview{grid-template-columns:1fr}.span2,.form-grid fieldset{grid-column:span 1}footer{gap:20px;line-height:1.7}#toast{left:15px;right:15px;transform:none}.metric h3{font-size:11px}}
+
+
+/* ARCHIVO: dist/rules.js */
+
+/* Lógica temporal independiente de la interfaz. */
+(function(root){
+  class Episodes{
+    constructor(){this.pending=new Map();this.active=new Map();this.previous=null;}
+    close(reason='Fin de observación'){
+      const closed=[...this.active.values()].map(e=>({...e,closed:true,closeReason:reason}));
+      this.pending.clear();this.active.clear();this.previous=null;return closed;
+    }
+    update(observations,t,cfg,makeId){
+      let changed=[];
+      if(this.previous!==null&&(t<this.previous||t-this.previous>cfg.maxGap))changed.push(...this.close('Discontinuidad'));
+      this.previous=t;
+      const keys=new Set();
+      for(const o of observations){
+        if(!Number.isInteger(o.id)||o.id<0)continue;
+        for(const [dim,reasons] of Object.entries(o.alerts||{})){
+          if(!['D1','D2','D3','D4'].includes(dim))continue;
+          const key=o.id+':'+dim;keys.add(key);
+          let p=this.pending.get(key);
+          if(!p||t-p.last>cfg.maxGap)p={start:t,last:t,hits:0};
+          p.last=t;p.hits++;this.pending.set(key,p);
+          if(p.hits<3||t-p.start<cfg.dwell)continue;
+          let e=this.active.get(o.id);
+          if(!e){e={id:makeId(),track:o.id,start:p.start,end:t,dimensions:{},status:'pending',principal:'',closed:false,origin:'automatic',created:new Date().toISOString(),notes:'',reviewer:'',audit:[]};this.active.set(o.id,e);}
+          e.dimensions[dim]=[...new Set([...(e.dimensions[dim]||[]),...reasons])].slice(0,30);
+        }
+      }
+      for(const key of this.pending.keys())if(!keys.has(key))this.pending.delete(key);
+      for(const [id,e] of this.active){
+        const o=observations.find(x=>x.id===id);
+        if(o&&Object.keys(e.dimensions).some(d=>o.alerts?.[d]))e.end=t;
+        if(t-e.end>cfg.release){e.closed=true;e.closeReason='Sin evidencia reciente';this.active.delete(id);}
+        changed.push(JSON.parse(JSON.stringify(e)));
+      }
+      return changed;
+    }
+  }
+  const csvCell=v=>{let s=String(v??'');if(/^[\s]*[=+\-@]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';};
+  const count=events=>Object.fromEntries(['D1','D2','D3','D4'].map(d=>[d,events.filter(e=>e.status==='confirmed'&&e.principal===d).length]));
+  const api={Episodes,csvCell,count};if(typeof module!=='undefined')module.exports=api;else root.CupriRules=api;
+})(typeof window!=='undefined'?window:globalThis);
+
+
+/* ARCHIVO: dist/app.js */
+
+'use strict';
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const DIM={D1:'Ausencia o uso inadecuado de equipos de protección personal',D2:'Aproximación a áreas restringidas',D3:'Posturas y posiciones inseguras',D4:'Trabajo cerca de vehículos y equipos en movimiento'};
+const SHORT={D1:'Equipos de protección personal',D2:'Áreas restringidas',D3:'Posturas y posiciones',D4:'Vehículos y equipos en movimiento'};
+const defaults={task:'',responsible:'',validated:false,viewOK:false,gear:{casco:true,chaleco:true,ocular:true,guantes:true},confidence:.5,dwell:1.5,maxGap:5,release:2,trunk:0,arm:0,knee:0,distance:0,speed:0,radius:0,zones:{},calibration:null,geometryValid:false};
+let cfg=structuredClone(defaults),events=[],db,engine=null,backend='',running=false,stream=null,mediaURL=null,mode=null,sourceName='',session=crypto.randomUUID(),segment=0,lastFrame=null,lastResult=null,drawMode=null,points=[],filter='all',ipTimer=null,autoTimer=null,busy=false,connectionGeneration=0;
+const book=new CupriRules.Episodes(),video=$('#video'),ip=$('#ip-image'),canvas=$('#overlay'),ctx=canvas.getContext('2d');
+try{cfg={...defaults,...JSON.parse(localStorage.getItem('cupri-profile')||'{}'),geometryValid:false};}catch{}
+const statusName={pending:'Pendiente',confirmed:'Confirmado',discarded:'Descartado',uncertain:'Indeterminado',duplicate:'Duplicado'};
+function toast(text){$('#toast').textContent=text;$('#toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').hidden=true,6500);}
+function text(node,value){node.textContent=value;return node;}
+function el(tag,cls,content){const n=document.createElement(tag);if(cls)n.className=cls;if(content!==undefined)n.textContent=content;return n;}
+function saveProfile(){try{localStorage.setItem('cupri-profile',JSON.stringify({...cfg,geometryValid:false}));}catch{toast('No se pudo guardar el perfil. Exporta el proyecto.');}renderProfile();}
+function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('cuprivision-local',1);req.onupgradeneeded=()=>req.result.createObjectStore('events',{keyPath:'id'});req.onerror=()=>reject(req.error);req.onsuccess=()=>resolve(req.result);});}
+function dbSave(event){if(!db)return;const tx=db.transaction('events','readwrite');tx.objectStore('events').put(structuredClone(event));tx.onerror=()=>{text($('#storage-status'),'Guardado fallido: exporta el proyecto');toast('No hay espacio para guardar. Exporta tu proyecto antes de cerrar.');};}
+function remember(event){const at=events.findIndex(e=>e.id===event.id),old=at>=0?events[at]:null;const merged={...old,...event};if(!merged.evidence&&frameReady())merged.evidence=capture(800,.65);if(!merged.session){merged.session=session;merged.segment=segment;merged.source=sourceName;merged.task=cfg.task;merged.profile=structuredClone(cfg);merged.models=structuredClone(engine?.models||{});}if(at>=0)events[at]=merged;else events.unshift(merged);dbSave(merged);}
+function renderMetrics(){const counts=CupriRules.count(events),host=$('#metrics');host.replaceChildren();for(const d of Object.keys(DIM)){const card=el('article','metric'),top=el('div','metric-top');top.append(el('span','dim-badge',d),el('span','mini',events.filter(e=>e.status==='pending'&&e.dimensions[d]).length+' pendientes'));card.append(top,el('h3','',SHORT[d]));const bottom=el('div','metric-bottom');bottom.append(el('span','metric-number',counts[d]),el('small','','confirmados'));card.append(bottom);host.append(card);}text($('#nav-count'),events.length);}
+function renderEvents(){renderMetrics();text($('#event-count'),events.length);const list=events.filter(e=>filter==='all'||e.status===filter).sort((a,b)=>b.created.localeCompare(a.created));const tbody=$('#event-rows');tbody.replaceChildren();$('#empty-events').hidden=!!list.length;for(const e of list){const tr=el('tr'),id=el('td','',e.id.slice(0,8).toUpperCase());id.append(el('small','',`${e.start.toFixed(1)}–${e.end.toFixed(1)} s · ID ${e.track}`));const dims=el('td','',Object.keys(e.dimensions).join(' · '));if(e.principal)dims.append(el('small','','Principal: '+e.principal));const origin=el('td','',e.origin==='manual'?'Manual':'Automático');origin.append(el('small','',e.source||''));const state=el('td');state.append(el('span','status '+e.status,statusName[e.status]));const action=el('td'),button=el('button','text-btn',e.closed?'Revisar →':'En curso');button.disabled=!e.closed;button.onclick=()=>reviewEvent(e.id);action.append(button);tr.append(id,dims,origin,state,action);tbody.append(tr);}}
+function renderProfile(){text($('#task-name'),cfg.task||'Sin configurar');text($('#profile-summary'),cfg.validated?'Criterios revisados · '+cfg.responsible:'Define y revisa los criterios de esta tarea.');$('#geometry-valid').checked=cfg.geometryValid;text($('#geometry-status'),Object.keys(cfg.zones).length+' zonas · '+(cfg.calibration?'Calibración configurada':'Sin calibración métrica'));const host=$('#profile-overview');host.replaceChildren();for(const d of Object.keys(DIM)){const a=el('article');a.append(el('span','dim-badge',d),el('h3','',DIM[d]));const desc=d==='D1'?'EPP exigido: '+Object.entries(cfg.gear).filter(x=>x[1]).map(x=>x[0]).join(', '):d==='D2'?'Zonas restringidas y de aproximación. Autorizaciones por trayectoria temporal.':d==='D3'?`Tronco: ${cfg.trunk||'sin definir'}°. Brazo: ${cfg.arm||'sin definir'}°. Rodilla: ${cfg.knee||'sin definir'}°. Vista 2D: ${cfg.viewOK?'revisada':'pendiente'}.`:`Separación: ${cfg.distance||'sin definir'} m. Movimiento: ${cfg.speed||'sin definir'} m/s. Radio envolvente: ${cfg.radius||'sin definir'} m.`;a.append(el('p','',desc));host.append(a);}updateButtons();}
+function view(name){$('#monitor-view').hidden=name!=='monitor';$('#profile-view').hidden=name!=='profile';$('#events-section').hidden=name==='profile';text($('#page-title'),name==='monitor'?'Monitoreo de seguridad':name==='events'?'Revisión de eventos':'Criterios y zonas');text($('#breadcrumb-current'),name==='monitor'?'Monitoreo':name==='events'?'Eventos':'Criterios y zonas');$$('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===name));}
+$$('[data-view]').forEach(b=>b.onclick=()=>view(b.dataset.view));$$('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;$$('[data-filter]').forEach(x=>x.classList.toggle('selected',x===b));renderEvents();});
+function modal(title,html,handler,label='Guardar'){text($('#dialog-title'),title);$('#dialog-content').innerHTML=html;text($('#dialog-submit'),label);$('#dialog-submit').hidden=!handler;$('#dialog').showModal();$('#dialog-form').onsubmit=async e=>{e.preventDefault();try{const done=await handler(new FormData(e.target));if(done!==false)$('#dialog').close();}catch(err){toast(err.message);}};}
+$('#close-dialog').onclick=$('#cancel-dialog').onclick=()=>$('#dialog').close();
+function input(name,label,type='number',extra=''){return `<label>${label}<input name="${name}" type="${type}" ${extra}></label>`;}
+function profileDialog(){if(running)stopAnalysis('Edición de criterios');const fields=[['confidence','Confianza del detector','min="0.1" max="0.95" step="0.05"'],['dwell','Persistencia de evidencia (s)','min="0.1" max="120" step="0.1"'],['maxGap','Máximo intervalo sin observación (s)','min="0.5" max="60" step="0.5"'],['release','Cierre sin evidencia (s)','min="0.1" max="120" step="0.1"'],['trunk','D3 · Tronco: ángulo máximo (°)','min="0" max="180" step="1"'],['arm','D3 · Brazo: elevación máxima (°)','min="0" max="180" step="1"'],['knee','D3 · Rodilla: ángulo mínimo (°)','min="0" max="180" step="1"'],['distance','D4 · Separación de seguridad (m)','min="0" max="100" step="0.1"'],['speed','D4 · Umbral de movimiento (m/s)','min="0" max="50" step="0.01"'],['radius','D4 · Radio envolvente máximo (m)','min="0" max="100" step="0.1"']];modal('Criterios de la tarea',`<div class="form-grid">${input('task','Tarea observada','text','required maxlength="150"')}${input('responsible','Responsable de los criterios','text','required maxlength="100"')}<fieldset><legend>D1 · EPP exigido por la tarea</legend>${Object.keys(cfg.gear).map(g=>`<label class="check"><input type="checkbox" name="gear-${g}">${g==='ocular'?'Protección ocular':g[0].toUpperCase()+g.slice(1)}</label>`).join('')}</fieldset>${fields.map(([n,l,a])=>input(n,l,'number',a+' required')).join('')}<p class="form-note span2">Cero desactiva una regla de D3 o D4. Los umbrales deben corresponder al trabajo observado; no son límites normativos universales.</p><label class="check span2"><input type="checkbox" name="viewOK">La vista es adecuada para los criterios posturales 2D.</label><label class="check span2"><input type="checkbox" name="validated">Los criterios y requisitos fueron revisados para esta tarea.</label></div>`,async f=>{const next={...cfg,task:f.get('task').trim(),responsible:f.get('responsible').trim(),validated:f.has('validated'),viewOK:f.has('viewOK')};for(const [n]of fields){next[n]=Number(f.get(n));if(!Number.isFinite(next[n]))throw Error('Valor numérico inválido.');}next.gear=Object.fromEntries(Object.keys(cfg.gear).map(g=>[g,f.has('gear-'+g)]));cfg=next;saveProfile();await resetEngine();toast('Criterios guardados.');});for(const k of ['task','responsible',...fields.map(x=>x[0])])$(`#dialog [name="${k}"]`).value=cfg[k];for(const k of ['validated','viewOK'])$(`#dialog [name="${k}"]`).checked=cfg[k];for(const g of Object.keys(cfg.gear))$(`#dialog [name="gear-${g}"]`).checked=cfg.gear[g];}
+$('#profile-btn').onclick=$('#edit-profile-full').onclick=profileDialog;
+async function api(path,data,timeout=15000){if(!backend)throw Error('Conecta primero el motor local.');const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);try{const res=await fetch(backend+path,{method:data===undefined?'GET':'POST',headers:data===undefined?{}:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),signal:controller.signal});const value=await res.json();if(!res.ok)throw Error(value.detail||'Error del motor local');return value;}catch(e){if(e.name==='AbortError')throw Error('El motor no respondió a tiempo. Comprueba la consola local.');throw e;}finally{clearTimeout(timer);}}
+function renderEngine(){const online=!!engine;text($('#engine-label'),online?(engine.loading?'Cargando modelos':engine.pose?'Motor conectado':'Conectado · sin modelos'):'Motor sin conectar');$('#engine-dot').classList.toggle('online',online);text($('#engine-note'),online?(engine.pose?'Pose lista. EPP: '+(engine.ppe?'disponible':'sin cargar')+'. Equipos: '+(engine.machines?'disponible':'sin cargar')+'.':'Abre la conexión para cargar los modelos.'): 'Conecta el motor local para analizar imágenes.');text($('#connect-btn'),online?'Estado y modelos ↗':'Conectar motor local ↗');updateButtons();}
+function connectionDialog(){modal('Motor local de análisis',`<p class="form-note">Descarga el programa, ejecuta <b>INICIAR_WINDOWS.bat</b> y abre la dirección local que aparece. El motor procesa los fotogramas en tu computadora. Si el navegador bloquea esta conexión desde la página privada, utiliza directamente <b>http://127.0.0.1:8765</b>.</p><label class="small-label">Dirección local<input id="backend-url" name="url" type="url" required></label><div id="connection-status" class="capability-list"></div><button type="button" id="load-models" class="outline" style="margin-top:12px">Cargar / reintentar modelos</button>`,async f=>{const u=new URL(f.get('url'));if(!['localhost','127.0.0.1','[::1]'].includes(u.hostname))throw Error('Usa la dirección del motor local.');backend=u.origin;engine=await api('/api/status');renderEngine();text($('#connection-status'),describeEngine());toast('Conexión establecida.');return false;},'Conectar');$('#backend-url').value=backend||'http://127.0.0.1:8765';text($('#connection-status'),describeEngine());$('#load-models').onclick=async()=>{try{if(!backend)throw Error('Conecta primero el motor.');await api('/api/load',{});toast('Descarga y carga iniciadas. Puedes seguir usando la interfaz.');pollEngine();}catch(e){toast(e.message);}};}
+function describeEngine(){if(!engine)return 'Sin conexión. No se han generado detecciones.';return `Pose: ${engine.pose?'lista':'no disponible'} · EPP: ${engine.ppe?'listo':'no disponible'} · Equipos: ${engine.machines?'listo':'no disponible'}. ${engine.loading?'Cargando… ':''}${(engine.errors||[]).join(' ')} ${engine.classes? 'Clases EPP: '+engine.classes.join(', '):''}`;}
+async function pollEngine(){try{engine=await api('/api/status');renderEngine();if($('#connection-status'))text($('#connection-status'),describeEngine());if(engine.loading)setTimeout(pollEngine,2000);}catch(e){engine=null;renderEngine();toast('Conexión perdida: '+e.message);}}
+$('#connect-btn').onclick=connectionDialog;
+async function resetEngine(){segment++;lastResult=null;if(backend&&engine){try{await api('/api/reset',{});}catch{engine=null;renderEngine();}}}
+function frameReady(){return mode==='ip'?ip.complete&&ip.naturalWidth>0:video.readyState>=2;}
+function imageSize(){return mode==='ip'?[ip.naturalWidth,ip.naturalHeight]:[video.videoWidth,video.videoHeight];}
+function capture(width=960,quality=.7){if(!frameReady())return null;const [w,h]=imageSize(),c=document.createElement('canvas');c.width=Math.min(width,w);c.height=Math.round(c.width*h/w);c.getContext('2d').drawImage(mode==='ip'?ip:video,0,0,c.width,c.height);return c.toDataURL('image/jpeg',quality);}
+function updateButtons(){$('#analyze-btn').disabled=running||busy||!frameReady()||!engine?.pose||!cfg.validated;$('#stop-btn').disabled=!running;$('#draw-btn').disabled=!frameReady();}
+function stopAnalysis(reason='Detenido por el operador'){running=false;clearTimeout(autoTimer);for(const e of book.close(reason))remember(e);text($('#analysis-state'),'Análisis detenido');text($('#source-tag'),mode?'CONECTADO':'EN ESPERA');updateButtons();renderEvents();}
+async function releaseSource(){connectionGeneration++;stopAnalysis('Cambio de fuente');clearTimeout(ipTimer);if(mode==='ip'&&backend&&engine){try{await api('/api/camera/close',{});}catch{}}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}video.pause();video.srcObject=null;video.removeAttribute('src');video.load();if(mediaURL){URL.revokeObjectURL(mediaURL);mediaURL=null;}ip.removeAttribute('src');mode=null;cfg.geometryValid=false;session=crypto.randomUUID();await resetEngine();lastFrame=null;lastResult=null;renderProfile();}
+function sourceUI(name){sourceName=name;text($('#source-name'),name);$('#empty-camera').hidden=true;video.hidden=mode==='ip';ip.hidden=mode!=='ip';text($('#source-info'),mode==='video'?'Vídeo local. El análisis sigue el tiempo del archivo.':mode==='webcam'?'Webcam activa. Puedes detenerla con Nueva observación.':'Cámara recibida por el motor local.');text($('#source-tag'),'CONECTADO');$$('.source-tabs button').forEach(b=>b.classList.remove('selected'));$(mode==='video'?'#upload-btn':mode==='webcam'?'#webcam-btn':'#ip-btn').classList.add('selected');view('monitor');}
+$('#upload-btn').onclick=$('#empty-upload').onclick=()=>$('#video-file').click();$('#video-file').onchange=async e=>{const file=e.target.files[0];if(!file)return;await releaseSource();mode='video';mediaURL=URL.createObjectURL(file);video.src=mediaURL;video.controls=true;sourceUI(file.name);video.load();e.target.value='';};
+video.onloadeddata=()=>{updateButtons();};video.onerror=()=>toast('Este formato no se puede reproducir. Usa un MP4 H.264 o WebM compatible.');video.onended=()=>stopAnalysis('Fin del vídeo');video.onseeking=()=>{if(running)stopAnalysis('Salto en el vídeo');resetEngine();};
+$('#webcam-btn').onclick=async()=>{try{if(!navigator.mediaDevices?.getUserMedia)throw Error('La webcam requiere un navegador compatible y una página segura.');await releaseSource();stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});mode='webcam';video.srcObject=stream;video.muted=true;video.controls=false;sourceUI('Webcam del navegador');await video.play();updateButtons();}catch(e){toast('No se pudo abrir la webcam: '+e.message);}};
+$('#ip-btn').onclick=()=>{if(!engine){connectionDialog();return;}modal('Conectar cámara IP / RTSP',`<p class="form-note">La cámara debe ser accesible desde la computadora donde ejecutas el motor. La dirección se usa en memoria y no se guarda en el proyecto.</p>${input('source','Dirección RTSP','password','required placeholder="rtsp://usuario:clave@direccion/ruta" autocomplete="off"')}`,async f=>{await releaseSource();await api('/api/camera/open',{source:f.get('source')});mode='ip';sourceUI('Cámara IP');const generation=connectionGeneration;const read=async()=>{if(mode!=='ip'||generation!==connectionGeneration)return;try{const data=await api('/api/camera/frame');if(mode!=='ip'||generation!==connectionGeneration)return;ip.src=data.image;lastFrame=data.time;ip.onload=updateButtons;}catch(e){toast(e.message);stopAnalysis('Error de cámara');return;}ipTimer=setTimeout(read,150);};read();},'Conectar');};
+$('#new-session').onclick=async()=>{await releaseSource();sourceName='';video.hidden=ip.hidden=true;$('#empty-camera').hidden=false;text($('#source-name'),'Sin fuente seleccionada');text($('#source-tag'),'EN ESPERA');text($('#clock'),'00:00');updateButtons();toast('Nueva observación. Los eventos anteriores se conservan.');};
+function sourceTime(){return mode==='video'?video.currentTime:mode==='ip'?(lastFrame??performance.now()/1000):performance.now()/1000;}
+async function analyze(){if(!running||busy)return;busy=true;const generation=connectionGeneration;try{if(!frameReady())throw Error('No hay un fotograma disponible.');if(mode==='video'&&video.paused){autoTimer=setTimeout(analyze,250);return;}const t=sourceTime(),frame=capture();const result=await api('/api/analyze',{image:frame,time:t,config:cfg},45000);if(!running||generation!==connectionGeneration)return;lastResult=result;for(const e of book.update(result.people,t,cfg,()=>crypto.randomUUID())){const old=events.find(x=>x.id===e.id);e.evidence=old?.evidence||frame;e.evidenceFrames={...(old?.evidenceFrames||{})};for(const d of Object.keys(e.dimensions))if(!e.evidenceFrames[d])e.evidenceFrames[d]=frame;remember(e);}renderEvents();text($('#processing-info'),`${result.people.length} personas · ${result.ms} ms / imagen`);text($('#analysis-state'),result.warnings?.length?result.warnings.join(' · '):'Analizando imágenes');}catch(e){stopAnalysis('Error del motor');toast(e.message);}finally{busy=false;updateButtons();if(running)autoTimer=setTimeout(analyze,150);}}
+$('#analyze-btn').onclick=async()=>{if(!cfg.validated||!engine?.pose||!frameReady())return;try{await resetEngine();if(mode==='video')await video.play();running=true;text($('#source-tag'),'ANALIZANDO');updateButtons();analyze();}catch(e){toast(e.message);}};$('#stop-btn').onclick=()=>stopAnalysis();
+function frameRect(){const [w,h]=imageSize(),W=canvas.width,H=canvas.height;if(!w||!h)return{x:0,y:0,w:W,h:H};const s=Math.min(W/w,H/h);return{x:(W-w*s)/2,y:(H-h*s)/2,w:w*s,h:h*s};}
+function paint(){const stage=$('#stage'),dpr=window.devicePixelRatio||1;const w=stage.clientWidth*dpr,h=stage.clientHeight*dpr;if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}ctx.clearRect(0,0,w,h);const r=frameRect();const pixel=p=>[r.x+p[0]*r.w,r.y+p[1]*r.h];function poly(points,color,close=true){if(!points.length)return;ctx.beginPath();points.forEach((p,i)=>{const [x,y]=pixel(p);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});if(close)ctx.closePath();ctx.strokeStyle=color;ctx.lineWidth=2*dpr;ctx.stroke();if(close){ctx.fillStyle=color+'18';ctx.fill();}}
+for(const [name,p]of Object.entries(cfg.zones))poly(p,({restricted:'#ffb46c',approach:'#e1d37a',position:'#a6a8ff'})[name]||'#b5df8b');if(cfg.calibration)poly(cfg.calibration.points.slice(0,4),'#6dd5cf');if(drawMode){poly(points,'#d8efa2',false);points.forEach((p,i)=>{const[x,y]=pixel(p);ctx.fillStyle='#d8efa2';ctx.beginPath();ctx.arc(x,y,4*dpr,0,7);ctx.fill();ctx.font=`${12*dpr}px sans-serif`;ctx.fillText(String(i+1),x+8*dpr,y-8*dpr);});}
+if(lastResult&&running)for(const p of lastResult.people){const [x1,y1]=pixel(p.box.slice(0,2)),[x2,y2]=pixel(p.box.slice(2));ctx.strokeStyle=Object.keys(p.alerts).length?'#ffbd70':'#abd5ac';ctx.lineWidth=2*dpr;ctx.strokeRect(x1,y1,x2-x1,y2-y1);ctx.font=`${12*dpr}px sans-serif`;ctx.fillStyle=ctx.strokeStyle;ctx.fillText(`ID ${p.id} ${Object.keys(p.alerts).join(' ')}`,x1,Math.max(y1-7*dpr,15*dpr));}
+if(mode==='video')text($('#clock'),`${String(Math.floor(video.currentTime/60)).padStart(2,'0')}:${String(Math.floor(video.currentTime%60)).padStart(2,'0')}`);requestAnimationFrame(paint);}
+function cancelDraw(){drawMode=null;points=[];$('#stage').classList.remove('drawing');$('#draw-hint').hidden=true;$('#finish-draw').hidden=true;}
+$('#draw-btn').onclick=()=>{if(!frameReady())return;stopAnalysis('Edición de geometría');if(mode==='video')video.pause();drawMode=$('#zone-kind').value;points=[];$('#stage').classList.add('drawing');$('#draw-hint').hidden=false;$('#finish-draw').hidden=false;text($('#draw-hint'),drawMode==='calibration'?'Marca 4 esquinas: (0,0), (ancho,0), (ancho,alto), (0,alto), y un 5.º punto independiente.':'Haz clic para añadir vértices. Guarda al terminar. Esc cancela.');};
+canvas.onclick=e=>{if(!drawMode)return;const b=canvas.getBoundingClientRect(),r=frameRect(),x=(e.clientX-b.left)*canvas.width/b.width,y=(e.clientY-b.top)*canvas.height/b.height;const p=[(x-r.x)/r.w,(y-r.y)/r.h];if(p.some(v=>v<0||v>1))return;if(drawMode==='calibration'&&points.length>=5)return;points.push(p);};
+function convex(p){if(p.length<3)return false;let sign=0;for(let i=0;i<p.length;i++){const a=p[i],b=p[(i+1)%p.length],c=p[(i+2)%p.length],z=(b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0]);if(Math.abs(z)<1e-7)return false;if(!sign)sign=Math.sign(z);else if(sign!==Math.sign(z))return false;}return true;}
+$('#finish-draw').onclick=()=>{if(!drawMode)return;if(drawMode==='calibration'){if(points.length!==5||!convex(points.slice(0,4))){toast('Marca cuatro esquinas ordenadas de un cuadrilátero convexo y el quinto punto.');return;}const selected=structuredClone(points);modal('Medidas de calibración',`<p class="form-note">Mide un rectángulo real en un suelo plano. El quinto punto comprueba la transformación y debe estar dentro del rectángulo. Mover la cámara invalida la calibración.</p><div class="form-grid">${[['width','Ancho real (m)'],['height','Alto real (m)'],['checkX','X del quinto punto (m)'],['checkY','Y del quinto punto (m)'],['tolerance','Error máximo admisible (m)']].map(([k,l])=>input(k,l,'number','required min="0" step="0.001"')).join('')}</div>`,async f=>{const c={points:selected};for(const k of ['width','height','checkX','checkY','tolerance'])c[k]=Number(f.get(k));if(c.width<=0||c.height<=0||c.tolerance<=0)throw Error('Dimensiones y tolerancia deben ser mayores que cero.');if(!engine)throw Error('Conecta el motor para comprobar matemáticamente la calibración.');const checked=await api('/api/calibrate',c);cfg.calibration={...c,...checked};cfg.geometryValid=false;saveProfile();cancelDraw();toast('Calibración comprobada. Error: '+checked.error.toFixed(3)+' m.');});}else{if(!convex(points)){toast('Usa un polígono convexo, sin cruces ni vértices repetidos.');return;}cfg.zones[drawMode]=structuredClone(points);cfg.geometryValid=false;saveProfile();cancelDraw();toast('Zona guardada. Confirma el encuadre antes de evaluar.');}};
+$('#clear-zone').onclick=()=>{stopAnalysis('Geometría modificada');const name=$('#zone-kind').value;if(name==='calibration')cfg.calibration=null;else delete cfg.zones[name];cfg.geometryValid=false;saveProfile();cancelDraw();};document.addEventListener('keydown',e=>{if(e.key==='Escape')cancelDraw();});$('#geometry-valid').onchange=e=>{cfg.geometryValid=e.target.checked;saveProfile();};
+$('#authorize-btn').onclick=()=>{if(!engine){toast('Conecta el motor y analiza para obtener un ID visible.');return;}modal('Autorización temporal',`<p class="form-note">Se aplica al ID actual, durante esta sesión. No identifica a la persona y se anula al perder la trayectoria, cambiar de fuente o reiniciar el motor.</p><div class="form-grid">${input('id','ID visible','number','required min="1" step="1"')}${input('duration','Vigencia (segundos)','number','required min="1" max="3600" step="1"')}${input('responsible','Responsable de autorizar','text','required maxlength="100"')}</div>`,async f=>{await api('/api/authorize',{id:Number(f.get('id')),duration:Number(f.get('duration')),responsible:f.get('responsible')});toast('Autorización registrada para la trayectoria actual.');});};
+$('#manual-btn').onclick=()=>{if(!frameReady()){toast('Carga un vídeo o conecta una cámara para adjuntar evidencia real.');return;}stopAnalysis('Observación manual');if(mode==='video')video.pause();const image=capture(),t=sourceTime();modal('Registrar observación manual',`<div class="form-grid"><label>Dimensión<select name="dimension">${Object.keys(DIM).map(d=>`<option>${d}</option>`).join('')}</select></label>${input('track','ID visible (0 si no existe)','number','required min="0" step="1" value="0"')}<label class="span2">Evidencia y contexto de la tarea<textarea name="notes" required maxlength="2000" placeholder="Describe lo que se observa, sin deducir lo que no es visible."></textarea></label></div><p class="form-note">Se guardará como pendiente de revisión con una captura del fotograma actual.</p>`,f=>{const dimension=f.get('dimension'),e={id:crypto.randomUUID(),track:Number(f.get('track')),start:t,end:t,dimensions:{[dimension]:[f.get('notes').trim()]},status:'pending',principal:'',closed:true,origin:'manual',created:new Date().toISOString(),notes:f.get('notes').trim(),reviewer:'',audit:[],evidence:image};remember(e);renderEvents();toast('Observación guardada con evidencia.');});};
+function reviewEvent(id){const e=events.find(x=>x.id===id);if(!e)return;modal('Revisar evento '+id.slice(0,8).toUpperCase(),`<img class="evidence-image" id="review-evidence" alt="Fotograma de evidencia"><label class="small-label">Evidencia por dimensión<select id="review-frame"></select></label><p id="review-description" class="form-note"></p><div class="form-grid"><label>Resultado<select name="status">${Object.entries(statusName).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select></label><label>Dimensión principal<select name="principal"><option value="">Seleccionar</option>${Object.keys(e.dimensions).map(d=>`<option>${d}</option>`).join('')}</select></label>${input('reviewer','Nombre del revisor','text','maxlength="100"')}${input('duplicateOf','ID completo del original (si es duplicado)','text')}<label class="span2">Justificación / tarea / condiciones del puesto<textarea name="notes" maxlength="4000"></textarea></label></div>`,f=>{const status=f.get('status'),reviewer=f.get('reviewer').trim(),principal=f.get('principal'),duplicate=f.get('duplicateOf').trim();if(status!=='pending'&&!reviewer)throw Error('Identifica al revisor.');if(status==='confirmed'&&!principal)throw Error('Selecciona una dimensión principal.');if(status==='duplicate'&&!events.some(x=>x.id===duplicate&&x.id!==id&&x.status==='confirmed'))throw Error('El original debe ser otro evento confirmado.');const audit={date:new Date().toISOString(),previous:e.status,status,reviewer,notes:f.get('notes'),principal,duplicateOf:duplicate};e.audit.push(audit);Object.assign(e,{status,reviewer,principal:status==='confirmed'?principal:'',notes:f.get('notes'),duplicateOf:status==='duplicate'?duplicate:''});dbSave(e);renderEvents();toast('Revisión guardada.');});$('#review-evidence').hidden=!e.evidence;if(e.evidence)$('#review-evidence').src=e.evidence;const frames=e.evidenceFrames||{};for(const d of Object.keys(e.dimensions))$('#review-frame').append(el('option','',d));$('#review-frame').onchange=()=>{const pic=frames[$('#review-frame').value]||e.evidence;if(pic)$('#review-evidence').src=pic;};$('#review-frame').onchange();text($('#review-description'),Object.entries(e.dimensions).map(([d,r])=>d+': '+r.join('; ')).join(' | '));for(const k of ['status','principal','reviewer','notes'])$(`#dialog [name="${k}"]`).value=e[k]||'';$('[name="duplicateOf"]').value=e.duplicateOf||'';}
+function download(name,content,type){const url=URL.createObjectURL(new Blob([content],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
+$('#csv-btn').onclick=()=>{const cols=['id','source','task','track','start','end','origin','status','principal','dimensions','reviewer','notes','duplicateOf'];const rows=[cols,...events.map(e=>cols.map(k=>k==='dimensions'?JSON.stringify(e.dimensions):e[k]??''))];download('CUPRIVISION_eventos.csv','\ufeff'+rows.map(r=>r.map(CupriRules.csvCell).join(';')).join('\r\n'),'text/csv;charset=utf-8');};
+$('#project-export').onclick=()=>download('CUPRIVISION_proyecto.json',JSON.stringify({format:'cuprivision-1',exported:new Date().toISOString(),config:{...cfg,geometryValid:false},events},null,2),'application/json');$('#project-import-btn').onclick=()=>$('#project-import').click();
+$('#project-import').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>30*1024*1024)throw Error('Máximo 30 MB por proyecto.');const data=JSON.parse(await file.text());if(data.format!=='cuprivision-1'||!Array.isArray(data.events)||data.events.length>1000)throw Error('Proyecto no compatible.');for(const x of data.events){if(typeof x.id!=='string'||typeof x.created!=='string'||!Number.isFinite(x.start)||!Number.isFinite(x.end)||!Object.keys(statusName).includes(x.status)||!x.dimensions||Object.keys(x.dimensions).some(d=>!Object.hasOwn(DIM,d))||Object.values(x.dimensions).some(r=>!Array.isArray(r)||r.some(y=>typeof y!=='string'))||!Array.isArray(x.audit))throw Error('Un evento no tiene el formato esperado.');if(x.evidence&&!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(x.evidence))throw Error('Evidencia no válida.');if(x.evidenceFrames&&Object.values(x.evidenceFrames).some(pic=>typeof pic!=='string'||!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(pic)))throw Error('Evidencias por dimensión inválidas.');if(x.status==='confirmed'&&!x.dimensions[x.principal])throw Error('Dimensión principal inválida.');}stopAnalysis('Importación');for(const x of data.events)remember({...x,closed:true});renderEvents();toast('Eventos importados. Los criterios actuales se conservan; el perfil original está dentro de cada evento.');}catch(err){toast(err.message);}finally{e.target.value='';}};
+$('#help-btn').onclick=()=>modal('Cómo usar CUPRIVISION',`<ol class="help-list"><li>Carga un vídeo o abre la webcam. Esto funciona sin el motor.</li><li>Para análisis automático, descarga el programa y ejecuta <b>INICIAR_WINDOWS.bat</b>. Abre <b>http://127.0.0.1:8765</b>.</li><li>Conecta el motor y pulsa <b>Cargar modelos</b>. La primera descarga necesita internet.</li><li>Configura tarea, EPP y criterios revisados. Dibuja y confirma las zonas.</li><li>Para D4, calibra con cuatro esquinas medidas y un quinto punto independiente. Define separación, velocidad y radio del equipo.</li><li>Inicia el análisis. Deténlo antes de revisar los eventos. Confirma únicamente evidencia suficiente y asigna una dimensión principal.</li><li>Exporta el proyecto para conservar capturas y revisiones. El CSV incluye también pendientes, identificados por su estado.</li></ol><p class="form-note">D1 usa clases explícitas del modelo: no detectar un equipo no equivale a detectar su ausencia. D3 utiliza geometría 2D por tarea. D4 estima distancias en el plano del suelo. No se ha validado precisión con grabaciones de tu investigación.</p><a class="download" href="downloads/CUPRIVISION.zip" download>↓ Descargar programa y documentación</a>`,null);
+window.addEventListener('beforeunload',()=>{if(stream)stream.getTracks().forEach(t=>t.stop());});
+(async()=>{try{db=await openDB();events=await new Promise((resolve,reject)=>{const req=db.transaction('events').objectStore('events').getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});for(const e of events)if(!e.closed){e.closed=true;e.closeReason='Sesión anterior interrumpida';dbSave(e);}}catch{toast('Almacenamiento local no disponible. Exporta antes de cerrar.');}renderProfile();renderEvents();paint();if(['127.0.0.1','localhost'].includes(location.hostname)){backend=location.origin;try{engine=await api('/api/status');renderEngine();}catch{}}})();
+
+
+# ARCHIVO: requirements.txt
+
+ultralytics==8.4.63
+huggingface_hub>=0.27,<2
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+lap>=0.5.12
+
+
+REM ARCHIVO: INICIAR_WINDOWS.bat
+
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist .venv\Scripts\python.exe (
+  py -3.11 -m venv .venv
+  if errorlevel 1 goto error
+)
+if not exist .venv\cupri_instalado (
+  .venv\Scripts\python.exe -m pip install --upgrade pip
+  if errorlevel 1 goto error
+  .venv\Scripts\python.exe -m pip install -r requirements.txt
+  if errorlevel 1 goto error
+  echo instalado>.venv\cupri_instalado
+)
+echo Abre http://127.0.0.1:8765 en tu navegador.
+.venv\Scripts\python.exe local\server.py
+pause
+exit /b
+:error
+echo No se pudo completar la instalacion. Instala Python 3.11 y revisa tu conexion.
+pause
+exit /b 1
+
+
+# ARCHIVO: make_package.py
+
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+
+def build():
+    root=Path(__file__).resolve().parent
+    target=root/'dist'/'downloads'/'CUPRIVISION.zip'
+    target.parent.mkdir(exist_ok=True)
+    names=['README.md','VALIDACION.md','requirements.txt','INICIAR_WINDOWS.bat','make_package.py',
+           'dist/index.html','dist/style.css','dist/app.js','dist/rules.js',
+           'local/server.py','local/engine.py','tests/test_rules.py','tests/test_api.py','tests/test_episodes.cjs']
+    temp=target.with_suffix('.tmp')
+    with ZipFile(temp,'w',ZIP_DEFLATED) as z:
+        for name in names:z.write(root/name,'CUPRIVISION/'+name)
+    temp.replace(target)
+    return target
+if __name__=='__main__':print(build())
+
+
+# ARCHIVO: tests/test_rules.py
+
+import sys, copy, unittest
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'local'))
+import numpy as np
+from engine import Engine,calibration,project,gear_class,inside
+
+CFG=dict(task='Prueba técnica',responsible='Test',validated=True,viewOK=False,gear=dict(casco=True,chaleco=True,ocular=True,guantes=True),confidence=.5,dwell=1.5,maxGap=5,release=2,trunk=0,arm=0,knee=0,distance=1,speed=.1,radius=1,zones={},geometryValid=True,calibration=None)
+CAL=dict(points=[[0,0],[1,0],[1,1],[0,1],[.5,.5]],width=10,height=10,checkX=5,checkY=5,tolerance=.1)
+def person():return dict(id=1,kp=np.zeros((17,2)),kc=np.zeros(17),box=[.2,.1,.4,.8],foot=[.3,.8],gear={})
+class Rules(unittest.TestCase):
+ def test_absence_is_not_non_detection(self):
+  e=Engine();p=person();self.assertEqual(e.rules(p,[],CFG,1,None),{})
+  p['gear']={'casco':{'absent':.9}}
+  self.assertIn('D1',e.rules(p,[],CFG,1,None))
+  p['gear']['casco']['present']=.92
+  self.assertNotIn('D1',e.rules(p,[],CFG,1,None))
+ def test_class_mapping(self):
+  self.assertEqual(gear_class('NO-Safety Vest'),('chaleco','absent'))
+  self.assertEqual(gear_class('no_gloves'),('guantes','absent'))
+  self.assertIsNone(gear_class('Mask'))
+ def test_authorization_suppresses_only_zone(self):
+  e=Engine();c=copy.deepcopy(CFG);c['zones']={'restricted':[[0,0],[1,0],[1,1],[0,1]]};p=person()
+  self.assertIn('D2',e.rules(p,[],c,0,None));e.auth[1]={'expires':100}
+  self.assertNotIn('D2',e.rules(p,[],c,0,None))
+ def test_invisible_feet_no_zone_alert(self):
+  c=copy.deepcopy(CFG);c['zones']={'restricted':[[0,0],[1,0],[1,1],[0,1]]};p=person();p['foot']=None
+  self.assertNotIn('D2',Engine().rules(p,[],c,0,None))
+ def test_calibration_independent_check(self):
+  r=calibration(CAL);np.testing.assert_allclose(project([.2,.4],r['H']),[2,4],atol=1e-8)
+  bad=copy.deepcopy(CAL);bad['checkX']=8
+  with self.assertRaises(ValueError):calibration(bad)
+  bad=copy.deepcopy(CAL);bad['points'][4]=[0,0]
+  with self.assertRaises(ValueError):calibration(bad)
+ def test_static_equipment_does_not_alert(self):
+  c=copy.deepcopy(CFG);c['calibration']=CAL;H=calibration(CAL)['H'];p=person();e=Engine()
+  equipment=[{'id':2,'world':np.array([3,8]),'velocity':np.array([0,0])}]
+  self.assertNotIn('D4',e.rules(p,equipment,c,1,H))
+  equipment[0]['velocity']=np.array([.3,0]);self.assertIn('D4',e.rules(p,equipment,c,2,H))
+ def test_no_extrapolation_outside_calibrated_plane(self):
+  c=copy.deepcopy(CFG);c['calibration']=CAL;p=person();p['foot']=[1.2,.8]
+  self.assertNotIn('D4',Engine().rules(p,[{'id':2,'world':np.array([12,8]),'velocity':np.array([1,0])}],c,1,calibration(CAL)['H']))
+ def test_unreviewed_profile_no_alert(self):
+  c=copy.deepcopy(CFG);c['validated']=False;p=person();p['gear']={'casco':{'absent':.99}}
+  self.assertEqual(Engine().rules(p,[],c,0,None),{})
+ def test_missing_keypoints_no_posture_alert(self):
+  c=copy.deepcopy(CFG);c.update(viewOK=True,trunk=10,arm=10,knee=150)
+  self.assertNotIn('D3',Engine().rules(person(),[],c,0,None))
+ def test_velocity_requires_several_observations(self):
+  e=Engine();self.assertIsNone(e.velocity('x',[0,0],0,5));self.assertIsNone(e.velocity('x',[1,0],1,5))
+  np.testing.assert_allclose(e.velocity('x',[2,0],2,5),[1,0])
+  self.assertIsNone(e.velocity('x',[100,0],20,5))
+if __name__=='__main__':unittest.main()
+
+
+# ARCHIVO: tests/test_api.py
+
+import sys,unittest
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'local'))
+from fastapi.testclient import TestClient
+from server import app
+class API(unittest.TestCase):
+ def setUp(self):self.client=TestClient(app)
+ def test_starts_without_models(self):
+  r=self.client.get('/api/status');self.assertEqual(r.status_code,200);self.assertIn('pose',r.json())
+ def test_ui_is_served(self):
+  r=self.client.get('/');self.assertEqual(r.status_code,200);self.assertIn('CUPRIVISION',r.text)
+ def test_untrusted_origin_rejected(self):
+  r=self.client.post('/api/load',headers={'Origin':'https://example.com'});self.assertEqual(r.status_code,403)
+ def test_authorization_unknown_id(self):
+  r=self.client.post('/api/authorize',json={'id':999,'duration':60,'responsible':'Test'});self.assertEqual(r.status_code,400)
+ def test_camera_not_connected(self):self.assertEqual(self.client.get('/api/camera/frame').status_code,400)
+ def test_bad_calibration(self):self.assertEqual(self.client.post('/api/calibrate',json={}).status_code,400)
+if __name__=='__main__':unittest.main()
+
+
+/* ARCHIVO: tests/test_episodes.cjs */
+
+const assert=require('node:assert/strict');const {Episodes,count,csvCell}=require('../dist/rules.js');
+const cfg={dwell:1.5,maxGap:3,release:2};let seq=0;const id=()=>String(++seq);const obs=[{id:1,alerts:{D1:['casco'],D2:['zona']}}];
+let b=new Episodes();assert.equal(b.update(obs,0,cfg,id).length,0);assert.equal(b.update(obs,1,cfg,id).length,0);let result=b.update(obs,2,cfg,id);assert.equal(result.length,1);assert.deepEqual(Object.keys(result[0].dimensions).sort(),['D1','D2']);assert.equal(result[0].status,'pending');assert.equal(result[0].principal,'');assert.deepEqual(count(result),{D1:0,D2:0,D3:0,D4:0});
+result=b.update([],5,cfg,id);assert.equal(result[0].closed,true);assert.equal(result[0].end,2);
+b=new Episodes();b.update(obs,0,cfg,id);b.update([],1,cfg,id);assert.equal(b.update(obs,2,cfg,id).length,0);assert.equal(b.update(obs,3,cfg,id).length,0);assert.equal(b.update(obs,4,cfg,id).length,1);result=b.update(obs,30,cfg,id);assert.equal(result[0].closed,true);assert.equal(result.length,1);
+const confirmed={status:'confirmed',principal:'D2'};assert.equal(count([confirmed,{...confirmed,status:'duplicate'}]).D2,1);assert.equal(csvCell('=cmd()'),'"\'=cmd()"');assert.equal(csvCell('a"b'),'"a""b"');console.log('7 comprobaciones temporales, de conteo y CSV: OK');
+
+
+# ARCHIVO: .gitignore
+
+.venv/
+__pycache__/
+*.pyc
+local/models/
+*.log
+.env*

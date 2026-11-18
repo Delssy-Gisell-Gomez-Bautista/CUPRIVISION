@@ -1,0 +1,6 @@
+const assert=require('node:assert/strict');const {Episodes,count,csvCell}=require('../dist/rules.js');
+const cfg={dwell:1.5,maxGap:3,release:2};let seq=0;const id=()=>String(++seq);const obs=[{id:1,alerts:{D1:['casco'],D2:['zona']}}];
+let b=new Episodes();assert.equal(b.update(obs,0,cfg,id).length,0);assert.equal(b.update(obs,1,cfg,id).length,0);let result=b.update(obs,2,cfg,id);assert.equal(result.length,1);assert.deepEqual(Object.keys(result[0].dimensions).sort(),['D1','D2']);assert.equal(result[0].status,'pending');assert.equal(result[0].principal,'');assert.deepEqual(count(result),{D1:0,D2:0,D3:0,D4:0});
+result=b.update([],5,cfg,id);assert.equal(result[0].closed,true);assert.equal(result[0].end,2);
+b=new Episodes();b.update(obs,0,cfg,id);b.update([],1,cfg,id);assert.equal(b.update(obs,2,cfg,id).length,0);assert.equal(b.update(obs,3,cfg,id).length,0);assert.equal(b.update(obs,4,cfg,id).length,1);result=b.update(obs,30,cfg,id);assert.equal(result[0].closed,true);assert.equal(result.length,1);
+const confirmed={status:'confirmed',principal:'D2'};assert.equal(count([confirmed,{...confirmed,status:'duplicate'}]).D2,1);assert.equal(csvCell('=cmd()'),'"\'=cmd()"');assert.equal(csvCell('a"b'),'"a""b"');console.log('7 comprobaciones temporales, de conteo y CSV: OK');
